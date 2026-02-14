@@ -17,111 +17,126 @@ class SemanticTopology:
         self.model.eval()
         self.vocab_size = self.model.config.vocab_size
         raw_embeds = self.model.transformer.wte.weight.detach()
+        # L2 Normalize the embedding matrix for consistent cosine metrics
         self.embed_matrix = torch.nn.functional.normalize(raw_embeds, p=2, dim=1).numpy()
 
-    def get_metrics(self, text, top_k=50):
+    def get_latent_state(self, text, top_k=50):
+        """Extracts the distribution and center of mass for a given prompt."""
         inputs = self.tokenizer(text, return_tensors="pt")
-        token_count = inputs['input_ids'].shape[1]
         with torch.no_grad():
             outputs = self.model(**inputs)
             logits = outputs.logits[0, -1, :]
             probs = torch.softmax(logits, dim=-1)
             top_probs, top_indices = torch.topk(probs, top_k)
-            top_probs = (top_probs / top_probs.sum()).numpy().astype(np.float64)
-            support_vectors = self.embed_matrix[top_indices.numpy()]
-            z_cm = np.average(support_vectors, axis=0, weights=top_probs)
-            z_cm = z_cm / (np.linalg.norm(z_cm) + 1e-12)
-            return {'center': z_cm, 'probs': top_probs, 'support': support_vectors, 'tokens': token_count}
-
-    def compute_kappa(self, state_ref, state_target):
-        d_xy = cosine(state_ref['center'], state_target['center'])
-        if d_xy < 1e-7: return 0
-        M = cdist(state_ref['support'], state_target['support'], metric='cosine').astype(np.float64)
-        w1 = ot.emd2(state_ref['probs'], state_target['probs'], M)
-        return 1 - (w1 / d_xy)
-
-# --- EXPERIMENT SETUP ---
-def generate_gradient_prompts():
-    themes = ["Quantum mechanics", "Economic theory", "Baking a cake", "Ancient philosophy", "Jazz improvisation"]
-    constraints = ["", "is a subject that", "can be defined as the following:", 
-                   "follows a strict hierarchical structure where", 
-                   "must be analyzed through the formal logical lens of", 
-                   "in a first-order predicate logic syllogism, assuming P implies Q, then"]
-    gradient_list = []
-    for theme in themes:
-        for i, c in enumerate(constraints):
-            gradient_list.append({"theme": theme, "level": i, "prompt": f"{theme} {c}".strip()})
-    return gradient_list
-
-def generate_scrambled_controls(experiment_prompts, tokenizer, vocab_size):
-    controls = []
-    targets = [p for p in experiment_prompts if p['level'] == 5]
-    for item in targets:
-        length = tokenizer(item['prompt'], return_tensors='pt')['input_ids'].shape[1]
-        rand_ids = torch.randint(0, vocab_size, (1, length))
-        rand_text = tokenizer.decode(rand_ids[0], skip_special_tokens=True)
-        controls.append({"theme": item['theme'], "level": 5, "prompt": rand_text, "type": "Control"})
-    return controls
-
-# --- EXECUTION ---
-if __name__ == "__main__":
-    topo = SemanticTopology("gpt2")
-    ref_origin = topo.get_metrics("The")
-    
-    exp_cases = generate_gradient_prompts()
-    ctrl_cases = generate_scrambled_controls(exp_cases, topo.tokenizer, topo.vocab_size)
-    
-    results = []
-    print("\n[Running Hybrid Study...]")
-
-    # Process Experimental Data (with last_state tracking for Incremental Velocity)
-    for theme in tqdm(set(c['theme'] for c in exp_cases)):
-        theme_steps = [c for c in exp_cases if c['theme'] == theme]
-        last_state = None
-        for step in theme_steps:
-            curr_state = topo.get_metrics(step['prompt'])
-            kappa = topo.compute_kappa(ref_origin, curr_state)
+            top_probs = (top_probs / top_probs.sum()).numpy()
             
-            # Incremental Velocity Calculation
-            if last_state is not None:
-                v_inc = cosine(last_state['center'], curr_state['center']) / (curr_state['tokens'] - last_state['tokens'])
-            else:
-                v_inc = cosine(ref_origin['center'], curr_state['center']) / curr_state['tokens']
-                
-            results.append({"Level": step['level'], "Type": "Experiment", "Kappa": kappa, "Velocity": v_inc})
-            last_state = curr_state
+            indices = top_indices.numpy()
+            center_of_mass = np.average(self.embed_matrix[indices], axis=0, weights=top_probs)
+            
+            return {
+                "indices": indices,
+                "probs": top_probs,
+                "center": center_of_mass,
+                "token_count": inputs['input_ids'].shape[1]
+            }
 
-    # Process Control Data
-    for ctrl in tqdm(ctrl_cases):
-        state = topo.get_metrics(ctrl['prompt'])
-        kappa = topo.compute_kappa(ref_origin, state)
-        v_inc = cosine(ref_origin['center'], state['center']) / state['tokens']
-        results.append({"Level": 5, "Type": "Control", "Kappa": kappa, "Velocity": v_inc})
+    def compute_kappa(self, state_curr, state_prev):
+        """Calculates local Ollivier-Ricci curvature and distance between adjacent states."""
+        # 1-Wasserstein (EMD) Cost Matrix based on cosine distance
+        cost_matrix = cdist(self.embed_matrix[state_curr['indices']], 
+                            self.embed_matrix[state_prev['indices']], 
+                            metric='cosine')
+        
+        w1 = ot.emd2(state_curr['probs'], state_prev['probs'], cost_matrix)
+        d_xy = cosine(state_curr['center'], state_prev['center'])
+        
+        if d_xy < 1e-9: 
+            return 0.0, 0.0
+        
+        kappa = 1 - (w1 / d_xy)
+        return kappa, d_xy
 
-    df = pd.DataFrame(results)
-    df_exp = df[df['Type'] == 'Experiment']
-    df_ctrl = df[df['Type'] == 'Control']
+# --- EXPERIMENT EXECUTION ---
+topo = SemanticTopology()
+origin_state = topo.get_latent_state("The")
 
-    # --- PLOTTING ---
-    plt.figure(figsize=(10, 6))
-    plt.rcParams.update({'font.family': 'serif', 'font.size': 11})
-
-    scatter = plt.scatter(df_exp['Kappa'], df_exp['Velocity'], c=df_exp['Level'], 
-                          cmap='plasma', s=100, alpha=0.8, edgecolors='black', label='Semantic Gradient')
-    plt.scatter(df_ctrl['Kappa'], df_ctrl['Velocity'], c='gray', marker='x', 
-                s=100, linewidths=2, alpha=0.6, label='Null Model (Random)')
-
-    plt.colorbar(scatter).set_label('Gating Density (Constraint Level)', fontsize=12)
-    plt.title("The Syntactic Wall: Corrected Manifold Dynamics", fontsize=14, fontweight='bold')
-    plt.xlabel(r"Curvature ($\kappa$) [Hyperbolic $\leftarrow \rightarrow$ Euclidean]", fontsize=12)
-    plt.ylabel(r"Incremental Velocity ($V_{inc}$)", fontsize=12)
+results = []
+for g_idx in tqdm(range(30), desc="Processing Gradients"):
+    prompts = [
+        "The cat is on the mat.",
+        "The cat is on the mat, implying a spatial relationship.",
+        "The cat is on the mat, implying a spatial relationship constrained by gravity.",
+        "The cat is on the mat, implying a spatial relationship constrained by gravity and classical mechanics.",
+        "The cat is on the mat, implying a spatial relationship constrained by gravity and classical mechanics within a formal logical lens.",
+        "The cat is on the mat, implying a spatial relationship constrained by gravity and classical mechanics within a formal logical lens requiring absolute proof."
+    ]
     
-    # Complexity Penalty Trendline
-    z = np.polyfit(df_exp['Kappa'], df_exp['Velocity'], 1)
-    plt.plot(df_exp['Kappa'], np.poly1d(z)(df_exp['Kappa']), "r--", alpha=0.6, label=r"Complexity Penalty ($P_c$)")
+    prev_state = origin_state
+    for level, prompt in enumerate(prompts):
+        curr_state = topo.get_latent_state(prompt)
+        kappa, dist = topo.compute_kappa(curr_state, prev_state)
+        
+        tokens_added = curr_state['token_count'] - prev_state['token_count']
+        v_inc = dist / max(tokens_added, 1)
+        
+        results.append({
+            "Level": level, 
+            "Type": "Experiment", 
+            "Kappa": kappa, 
+            "Step_Distance": dist, 
+            "Velocity": v_inc
+        })
+        prev_state = curr_state
 
-    plt.legend()
-    plt.savefig("syntactic_wall_final.pdf", bbox_inches='tight')
-    plt.show()
+# --- NULL MODEL (CONTROL) ---
+for c_idx in tqdm(range(30), desc="Processing Control"):
+    prev_state = origin_state
+    for level in range(6):
+        random_tokens = "".join([chr(random.randint(97, 122)) for _ in range(random.randint(5, 20))])
+        curr_state = topo.get_latent_state(random_tokens)
+        kappa, dist = topo.compute_kappa(curr_state, prev_state)
+        v_inc = dist / 1 
+        results.append({
+            "Level": level, "Type": "Control", "Kappa": kappa, "Step_Distance": dist, "Velocity": v_inc
+        })
+        prev_state = curr_state
 
-    print(f"\nFinal Correlation (K vs Vinc): {df_exp['Kappa'].corr(df_exp['Velocity']):.4f}")
+df = pd.DataFrame(results)
+df_exp = df[df['Type'] == 'Experiment']
+df_ctrl = df[df['Type'] == 'Control']
+
+# --- FINAL METRICS ---
+avg_step_dist = df_exp['Step_Distance'].mean()
+print(f"\n--- Analysis Complete ---")
+print(f"Average Step Distance (Experiment): {avg_step_dist:.4f}")
+
+# --- PLOTTING ---
+plt.figure(figsize=(10, 6))
+plt.rcParams.update({'font.family': 'serif', 'font.size': 11})
+
+# Scatter for Experiment
+scatter = plt.scatter(df_exp['Kappa'], df_exp['Velocity'], c=df_exp['Level'], 
+                      cmap='plasma', s=100, alpha=0.8, edgecolors='black', label='Semantic Gradient')
+
+# Scatter for Control
+plt.scatter(df_ctrl['Kappa'], df_ctrl['Velocity'], c='gray', marker='x', 
+            s=100, linewidths=2, alpha=0.6, label='Null Model (Random)')
+
+# Visual elements
+plt.colorbar(scatter).set_label('Gating Density (Constraint Level)', fontsize=12)
+plt.title("Manifold Dynamics: Local Curvature vs. Incremental Velocity", fontsize=14, fontweight='bold')
+plt.xlabel(r"Local Curvature ($\kappa$)", fontsize=12)
+plt.ylabel(r"Incremental Velocity ($V_{inc}$)", fontsize=12)
+
+# Complexity Trendline (Geodesic Efficiency Check)
+z = np.polyfit(df_exp['Kappa'], df_exp['Velocity'], 1)
+p = np.poly1d(z)
+plt.plot(df_exp['Kappa'], p(df_exp['Kappa']), "r--", alpha=0.8, label=f"Trendline (r={np.corrcoef(df_exp['Kappa'], df_exp['Velocity'])[0,1]:.4f})")
+
+plt.grid(True, linestyle='--', alpha=0.6)
+plt.legend()
+plt.tight_layout()
+
+# SAVE OUTPUT
+plt.savefig("manifold_corrected_results.png", dpi=300)
+print("Plot saved as manifold_corrected_results.png")
